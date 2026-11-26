@@ -1,28 +1,75 @@
 name: 'Baidu Tieba Auto Sign'
 
+# 只保留定时 + 手动触发。
+# 原文件的 push 触发会在下面的"写回提交"之后额外跑一次签到，没有必要。
 on:
-  push:
-    branches:
-      - main
   schedule:
-    - cron: '5 16,22 * * *'
-    
+    - cron: '5 16,22 * * *'   # UTC 16:05 / 22:05 = 北京时间 00:05 / 06:05
   workflow_dispatch:
+
+# 关键 1：允许 GITHUB_TOKEN 把状态文件推回仓库，否则 git push 报 403。
+permissions:
+  contents: write
+
+# 两次签到并发时不要抢着写同一个文件。
+concurrency:
+  group: tieba-sign
+  cancel-in-progress: false
 
 jobs:
   tieba_sign:
     runs-on: ubuntu-latest
     steps:
-      - name: 'Checkout codes'
-        uses: actions/checkout@v2
-      - name: 'Set python'
-        uses: actions/setup-python@v1
+      - name: Checkout codes
+        uses: actions/checkout@v6
+
+      - name: Set python
+        uses: actions/setup-python@v6
         with:
-          python-version: '3.15'
-      - name: 'Install dependencies'
+          python-version: '3.x'   # 原为 3.15 + setup-python@v1，老版本解析不了
+
+      - name: Install dependencies
         run: python -m pip install --upgrade requests
-      - name: 'Start Sign'
+
+      - name: Start Sign
+        id: sign
         env:
           BDUSS: ${{ secrets.BDUSS }}
-        run: python main.py
+        run: |
+          # main.py 会把 BDUSS 明文打进日志，公开仓库的 Actions 日志任何人可读。
+          # 先逐个注册掩码，之后日志里出现这些值都会被替换成 ***。
+          IFS='#' read -ra _bduss_arr <<< "$BDUSS"
+          for _b in "${_bduss_arr[@]}"; do
+            if [ -n "$_b" ]; then
+              echo "::add-mask::$_b"
+            fi
+          done
+          python main.py
 
+      # 关键 2：每次运行产生一次"真实提交"，让仓库持续有活动。
+      # 公共仓库 60 天无活动，GitHub 会自动停用 schedule workflow 并提示重新启用。
+      # 只写运行状态，不写日志正文，不会把任何账号凭证带进仓库。
+      # GITHUB_TOKEN 产生的 push 不会再触发新的 workflow 运行，所以不会自循环。
+      - name: Keep repository active
+        if: always() && github.event_name != 'push'
+        env:
+          BRANCH: ${{ github.ref_name }}
+          RESULT: ${{ steps.sign.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          {
+            echo '# 贴吧签到 - 最近一次运行'
+            echo
+            echo "- 时间（UTC）：$(date -u +'%Y-%m-%d %H:%M:%S')"
+            echo "- 签到结果：$RESULT"
+            echo "- 运行详情：$RUN_URL"
+          } > LAST_SIGN.md
+          git add LAST_SIGN.md
+          if git diff --cached --quiet; then
+            echo 'Nothing to commit.'
+          else
+            git commit -m "chore(sign): record run $(date -u +%Y%m%dT%H%M%SZ)"
+            git push origin HEAD:"$BRANCH"
+          fi
